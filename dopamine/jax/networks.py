@@ -387,6 +387,55 @@ class ImplicitQuantileNetwork(nn.Module):
     return atari_lib.ImplicitQuantileNetworkType(quantile_values, quantiles)
 
 
+
+### Implicit Quantile Networks ###
+class ImplicitQuantileCrossentropyNetwork(nn.Module):
+  """The Implicit Quantile Network (Dabney et al., 2018).."""
+  num_actions: int
+  quantile_embedding_dim: int
+  inputs_preprocessed: bool = False
+  nr_bins: int = 51
+
+  @nn.compact
+  def __call__(self, x, num_quantiles, rng):
+    initializer = nn.initializers.variance_scaling(
+        scale=1.0 / jnp.sqrt(3.0),
+        mode='fan_in',
+        distribution='uniform')
+    if not self.inputs_preprocessed:
+      x = preprocess_atari_inputs(x)
+    x = nn.Conv(features=32, kernel_size=(8, 8), strides=(4, 4),
+                kernel_init=initializer)(x)
+    x = nn.relu(x)
+    x = nn.Conv(features=64, kernel_size=(4, 4), strides=(2, 2),
+                kernel_init=initializer)(x)
+    x = nn.relu(x)
+    x = nn.Conv(features=64, kernel_size=(3, 3), strides=(1, 1),
+                kernel_init=initializer)(x)
+    x = nn.relu(x)
+    x = x.reshape((-1))  # flatten
+    state_vector_length = x.shape[-1]
+    state_net_tiled = jnp.tile(x, [num_quantiles, 1])
+    quantiles_shape = [num_quantiles, 1]
+    quantiles = jax.random.uniform(rng, shape=quantiles_shape)
+    quantile_net = jnp.tile(quantiles, [1, self.quantile_embedding_dim])
+    quantile_net = (
+        jnp.arange(1, self.quantile_embedding_dim + 1, 1).astype(jnp.float32)
+        * onp.pi
+        * quantile_net)
+    quantile_net = jnp.cos(quantile_net)
+    quantile_net = nn.Dense(features=state_vector_length,
+                            kernel_init=initializer)(quantile_net)
+    quantile_net = nn.relu(quantile_net)
+    x = state_net_tiled * quantile_net
+    x = nn.Dense(features=512, kernel_init=initializer)(x)
+    x = nn.relu(x)
+    quantile_values = nn.Dense(features=self.num_actions * self.nr_bins,
+                               kernel_init=initializer)(x)
+    quantile_values = quantile_values.reshape(-1, self.num_actions, self.nr_bins)
+    return atari_lib.ImplicitQuantileNetworkType(quantile_values, quantiles)
+
+
 ### Quantile Networks ###
 @gin.configurable
 class QuantileNetwork(nn.Module):

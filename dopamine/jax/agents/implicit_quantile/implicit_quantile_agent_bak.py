@@ -35,27 +35,6 @@ import optax
 import tensorflow as tf
 
 
-
-v_max = 2000
-v_min = -10
-nr_bins = 51
-bin_width = (v_max - v_min) / nr_bins
-sigma_to_final_sigma_ratio = 0.75
-support = jnp.linspace(v_min, v_max, nr_bins + 1, dtype=jnp.float32)
-centers = (support[:-1] + support[1:]) / 2
-sigma = bin_width * sigma_to_final_sigma_ratio
-
-def hl_gauss_encode(x):
-    cdf_evals = jax.scipy.special.erf((support - x) / (jnp.sqrt(2) * sigma))
-    z = cdf_evals[-1] - cdf_evals[0]
-    target_probs = cdf_evals[1:] - cdf_evals[:-1]
-    target_probs /= z
-    return target_probs
-
-
-def convert_prob_to_value(probs):
-    return jnp.sum(probs * centers, axis=-1)
-
 @functools.partial(
     jax.vmap,
     in_axes=(None, None, None, 0, 0, 0, None, None, None, None, 0),
@@ -102,8 +81,6 @@ def target_quantile_values(network_def, online_params, target_params,
                                        num_quantiles=num_quantile_samples,
                                        rng=rng1)
   target_quantile_values_action = outputs_action.quantile_values
-  target_quantile_values_action = jax.vmap(jax.vmap(convert_prob_to_value))(
-      jax.nn.softmax(target_quantile_values_action, axis=-1)) #TODO try placing it later, look at c51
   target_q_values = jnp.squeeze(
       jnp.mean(target_quantile_values_action, axis=0))
   # Shape: batch_size.
@@ -119,12 +96,9 @@ def target_quantile_values(network_def, online_params, target_params,
   target_quantile_vals = (
       jax.vmap(lambda x, y: x[y])(next_state_target_outputs.quantile_values,
                                   next_qt_argmax))
-  target_quantile_vals = jax.vmap(convert_prob_to_value)(
-      jax.nn.softmax(target_quantile_vals, axis=-1))
   target_quantile_vals = rewards + gamma_with_terminal * target_quantile_vals
-  target_quantile_vals_hl = jax.vmap(hl_gauss_encode)(target_quantile_vals)
   # We return with an extra dimension, which is expected by train.
-  return rng, jax.lax.stop_gradient(target_quantile_vals_hl)
+  return rng, jax.lax.stop_gradient(target_quantile_vals[:, None])
 
 
 @functools.partial(jax.jit, static_argnums=(0, 3, 10, 11, 12, 13, 14, 15))
@@ -134,31 +108,31 @@ def train(network_def, online_params, target_params, optimizer, optimizer_state,
           double_dqn, kappa, rng):
   """Run a training step."""
   batch_size = states.shape[0]
-  def crossent_loss_fn(params, rng_input, target_quantile_vals):
+  def loss_fn(params, rng_input, target_quantile_vals):
     def online(state, key):
       return network_def.apply(params, state, num_quantiles=num_tau_samples,
                                rng=key)
 
     batched_rng = jnp.stack(jax.random.split(rng_input, num=batch_size))
     model_output = jax.vmap(online)(states, batched_rng)
-    quantile_values_logits = model_output.quantile_values
+    quantile_values = model_output.quantile_values
     quantiles = model_output.quantiles
-    chosen_action_quantile_values_logits = jax.vmap(lambda x, y: x[:, y])(
-        quantile_values_logits, actions)
-    # Shape of bellman_erors and crossent_loss:
+    chosen_action_quantile_values = jax.vmap(lambda x, y: x[:, y][:, None])(
+        quantile_values, actions)
+    # Shape of bellman_erors and huber_loss:
     # batch_size x num_tau_prime_samples x num_tau_samples x 1.
-
-    crossent_loss = optax.softmax_cross_entropy(
-        chosen_action_quantile_values_logits[:, None, :, :],
-        target_quantile_vals[:, :, None, :]
-    )[:, :, :, None]
-
-    target_quantile_vals_unbinned = jax.vmap(jax.vmap(convert_prob_to_value))(target_quantile_vals)
-    chosen_action_quantile_values_unbinned = jax.vmap(jax.vmap(convert_prob_to_value))(
-        jax.nn.softmax(chosen_action_quantile_values_logits, axis=-1))
-
-    overestimation = (chosen_action_quantile_values_unbinned[:, None, :] > target_quantile_vals_unbinned[:, :, None]
-                      )[:, :, :, None]
+    bellman_errors = (target_quantile_vals[:, :, None, :] -
+                      chosen_action_quantile_values[:, None, :, :])
+    # The huber loss (see Section 2.3 of the paper) is defined via two cases:
+    # case_one: |bellman_errors| <= kappa
+    # case_two: |bellman_errors| > kappa
+    huber_loss_case_one = (
+        (jnp.abs(bellman_errors) <= kappa).astype(jnp.float32) *
+        0.5 * bellman_errors ** 2)
+    huber_loss_case_two = (
+        (jnp.abs(bellman_errors) > kappa).astype(jnp.float32) *
+        kappa * (jnp.abs(bellman_errors) - 0.5 * kappa))
+    huber_loss = huber_loss_case_one + huber_loss_case_two
     # Tile by num_tau_prime_samples along a new dimension. Shape is now
     # batch_size x num_tau_prime_samples x num_tau_samples x 1.
     # These quantiles will be used for computation of the quantile huber loss
@@ -166,12 +140,12 @@ def train(network_def, online_params, target_params, optimizer, optimizer_state,
     quantiles = jnp.tile(quantiles[:, None, :, :],
                          [1, num_tau_prime_samples, 1, 1]).astype(jnp.float32)
     # Shape: batch_size x num_tau_prime_samples x num_tau_samples x 1.
-    quantile_loss = (jnp.abs(quantiles - jax.lax.stop_gradient(
-        overestimation.astype(jnp.float32))) * crossent_loss)
+    quantile_huber_loss = (jnp.abs(quantiles - jax.lax.stop_gradient(
+        (bellman_errors < 0).astype(jnp.float32))) * huber_loss) / kappa
     # Sum over current quantile value (num_tau_samples) dimension,
     # average over target quantile value (num_tau_prime_samples) dimension.
     # Shape: batch_size x num_tau_prime_samples x 1.
-    loss = jnp.sum(quantile_loss, axis=2)
+    loss = jnp.sum(quantile_huber_loss, axis=2)
     loss = jnp.mean(loss, axis=1)
     return jnp.mean(loss)
 
@@ -189,7 +163,7 @@ def train(network_def, online_params, target_params, optimizer, optimizer_state,
       cumulative_gamma,
       double_dqn,
       batched_target_rng)
-  grad_fn = jax.value_and_grad(crossent_loss_fn)
+  grad_fn = jax.value_and_grad(loss_fn)
   rng, rng_input = jax.random.split(rng)
   loss, grad = grad_fn(online_params, rng_input, target_quantile_vals)
   updates, optimizer_state = optimizer.update(grad, optimizer_state,
@@ -240,21 +214,11 @@ def select_action(network_def, params, state, rng, num_quantile_samples,
   p = jax.random.uniform(rng1)
   return rng, jnp.where(p <= epsilon,
                         jax.random.randint(rng2, (), 0, num_actions),
-                        jnp.argmax(
-                            jnp.mean(
-                                jax.vmap(jax.vmap(convert_prob_to_value))(
-                                    jax.nn.softmax(
-                                        network_def.apply(
-                                            params, state,
-                                            num_quantiles=num_quantile_samples,
-                                            rng=rng2
-                                        ).quantile_values,
-                                        axis=-1
-                                    )
-                                ),
-                                axis=0
-                            ), axis=0
-                        ))
+                        jnp.argmax(jnp.mean(
+                            network_def.apply(
+                                params, state,
+                                num_quantiles=num_quantile_samples,
+                                rng=rng2).quantile_values, axis=0), axis=0))
 
 
 @gin.configurable
@@ -266,7 +230,7 @@ class JaxImplicitQuantileAgent(dqn_agent.JaxDQNAgent):
                observation_shape=dqn_agent.NATURE_DQN_OBSERVATION_SHAPE,
                observation_dtype=dqn_agent.NATURE_DQN_DTYPE,
                stack_size=dqn_agent.NATURE_DQN_STACK_SIZE,
-               network=networks.ImplicitQuantileCrossentropyNetwork,
+               network=networks.ImplicitQuantileNetwork,
                kappa=1.0,
                num_tau_samples=32,
                num_tau_prime_samples=32,

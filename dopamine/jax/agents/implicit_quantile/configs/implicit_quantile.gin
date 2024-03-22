@@ -22,7 +22,7 @@ JaxImplicitQuantileAgent.optimizer = 'adam'
 create_optimizer.learning_rate = 0.00005
 create_optimizer.eps = 0.0003125
 
-atari_lib.create_atari_environment.game_name = 'Pong'
+atari_lib.create_atari_environment.game_name = 'Breakout'
 # Sticky actions with probability 0.25, as suggested by (Machado et al., 2017).
 atari_lib.create_atari_environment.sticky_actions = True
 create_runner.schedule = 'continuous_train'
