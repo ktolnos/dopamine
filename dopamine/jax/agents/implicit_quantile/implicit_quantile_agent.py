@@ -36,8 +36,8 @@ import tensorflow as tf
 
 
 
-v_max = 2000
-v_min = -10
+v_max = 15
+v_min = -2
 nr_bins = 51
 bin_width = (v_max - v_min) / nr_bins
 sigma_to_final_sigma_ratio = 0.75
